@@ -156,6 +156,28 @@ BLOCK_RULES = (
         re.compile(r"\b(curl|wget)\b[^\n|;]*[|;]\s*(?:sudo\s+)?(?:sh|bash)\b", re.IGNORECASE),
         "Remote download is piped directly into a shell.",
     ),
+    Rule(
+        "security-weakening",
+        "BLOCK",
+        re.compile(
+            r"\b(disable|bypass|weaken|turn off)\b.{0,80}"
+            r"\b(auto[-_ ]?review|sandbox|approval|firewall|gatekeeper|selinux|sip|policy)\b|"
+            r"\b(git\s+config\s+--global\s+http\.sslVerify\s+false|"
+            r"spctl\s+--master-disable|csrutil\s+disable|setenforce\s+0|ufw\s+disable)\b",
+            re.IGNORECASE,
+        ),
+        "Instruction appears to weaken approval, sandbox, or host security controls.",
+    ),
+    Rule(
+        "denial-circumvention",
+        "BLOCK",
+        re.compile(
+            r"\b(work ?around|route around|circumvent|retry indirectly)\b.{0,100}"
+            r"\b(denial|blocked|auto[-_ ]?review|approval|policy)\b",
+            re.IGNORECASE,
+        ),
+        "Instruction appears to route around an approval or auto-review denial.",
+    ),
 )
 
 WARNING_RULES = (

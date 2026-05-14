@@ -149,3 +149,38 @@ description: Fetch public release metadata for a repository and summarize the re
     assert payload["verified"] is True
     assert payload["report"]["verdict"] == "REVIEW"
     assert payload["receipt"]["override_review"] is True
+
+
+def test_usage_json_summarizes_receipts(tmp_path: Path) -> None:
+    skill = tmp_path / "network-skill"
+    _write_skill(
+        skill,
+        """---
+name: network-skill
+description: Fetch public release metadata for a repository and summarize the response for open-source maintenance planning without touching any user secrets.
+---
+
+# Network Skill
+""",
+        script="import urllib.request\nprint('ok')\n",
+    )
+    gate_home = tmp_path / "gate-home"
+    install_result = _run(
+        "install",
+        str(skill),
+        "--dest",
+        str(tmp_path / "installed"),
+        "--allow-review",
+        "--json",
+        gate_home=gate_home,
+    )
+    assert install_result.returncode == 0
+
+    usage_result = _run("usage", "--json", gate_home=gate_home)
+
+    assert usage_result.returncode == 0
+    payload = json.loads(usage_result.stdout)
+    assert payload["total_receipts"] == 1
+    assert payload["override_review_receipts"] == 1
+    assert payload["verdict_counts"]["REVIEW"] == 1
+    assert payload["skill_counts"]["network-skill"] == 1

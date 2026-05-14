@@ -7,6 +7,7 @@ import sys
 from .install import install_target, verify_installed_skill
 from .report import render_text_report
 from .scanner import InspectError, PolicyError, inspect_target
+from .usage import summarize_usage
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -27,6 +28,10 @@ def build_parser() -> argparse.ArgumentParser:
     verify_parser = subparsers.add_parser("verify", help="Re-inspect an installed skill directory")
     verify_parser.add_argument("target", help="Installed skill directory")
     verify_parser.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+
+    usage_parser = subparsers.add_parser("usage", help="Summarize install receipts and approved REVIEW usage")
+    usage_parser.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+    usage_parser.add_argument("--receipts-dir", help="Override receipts directory for reporting")
 
     return parser
 
@@ -80,6 +85,27 @@ def main(argv: list[str] | None = None) -> int:
                 for reason in result.reasons:
                     print(f"- VERIFY {reason}")
             return 0 if result.verified else 1
+
+        if args.command == "usage":
+            summary = summarize_usage(receipts_root=args.receipts_dir)
+            if args.json:
+                _print_json(summary)
+            else:
+                print(f"receipts_dir={summary['receipts_dir']}")
+                print(f"total_receipts={summary['total_receipts']}")
+                print(f"override_review_receipts={summary['override_review_receipts']}")
+                for verdict, count in (summary["verdict_counts"] or {}).items():
+                    print(f"verdict.{verdict}={count}")
+                for receipt in summary["receipts"]:
+                    print(
+                        "receipt="
+                        f"{receipt['receipt_id']} "
+                        f"skill={receipt['skill_name']} "
+                        f"verdict={receipt['verdict']} "
+                        f"override_review={str(receipt['override_review']).lower()} "
+                        f"path={receipt['installed_path']}"
+                    )
+            return 0
     except (InspectError, PolicyError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
