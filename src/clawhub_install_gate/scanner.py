@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -52,6 +53,117 @@ ARCHIVE_SUFFIXES = {
 SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", ".ruff_cache", "node_modules"}
 MAX_TEXT_BYTES = 1_000_000
 SEVERITY_ORDER = {"BLOCK": 0, "WARNING": 1, "INFO": 2}
+DYNAMIC_CODE_MESSAGE = "Dynamic code execution requires manual review."
+JS_IDENTIFIER_RE = r"[A-Za-z_$][A-Za-z0-9_$]*"
+JS_SPACE_RE = r"(?:\s|/\*[\s\S]*?\*/)*"
+JS_REQUIRED_SPACE_RE = r"(?:\s|/\*[\s\S]*?\*/)+"
+JS_GLOBAL_RE = r"(?:window|globalThis|self|global)"
+JS_STRING_QUOTE_RE = r"['\"`]"
+JS_OBJECT_ACCESS_RE = (
+    rf"(?:{JS_SPACE_RE}(?:(?:\?\.|\.){JS_SPACE_RE}{JS_IDENTIFIER_RE}|"
+    rf"\[{JS_SPACE_RE}(?:\d+|{JS_STRING_QUOTE_RE}{JS_IDENTIFIER_RE}{JS_STRING_QUOTE_RE}){JS_SPACE_RE}\]))"
+)
+JS_OBJECT_RE = (
+    rf"(?:{JS_IDENTIFIER_RE}(?:{JS_OBJECT_ACCESS_RE})*|"
+    rf"\({JS_SPACE_RE}{JS_IDENTIFIER_RE}{JS_SPACE_RE}\)(?:{JS_OBJECT_ACCESS_RE})*)"
+)
+JS_WS_MEMBER_ACCESS_RE = (
+    rf"{JS_OBJECT_RE}{JS_SPACE_RE}(?:(?:\?\.|\.){JS_SPACE_RE}WebSocket\b|"
+    rf"(?:\?\.{JS_SPACE_RE})?\[{JS_SPACE_RE}{JS_STRING_QUOTE_RE}WebSocket{JS_STRING_QUOTE_RE}{JS_SPACE_RE}\])"
+)
+JS_WS_GLOBAL_ACCESS_RE = (
+    rf"(?:{JS_GLOBAL_RE}{JS_SPACE_RE}(?:(?:\?\.|\.){JS_SPACE_RE}WebSocket|"
+    rf"(?:\?\.{JS_SPACE_RE})?\[{JS_SPACE_RE}{JS_STRING_QUOTE_RE}WebSocket{JS_STRING_QUOTE_RE}{JS_SPACE_RE}\])|"
+    rf"\({JS_SPACE_RE}{JS_GLOBAL_RE}{JS_SPACE_RE}\){JS_SPACE_RE}"
+    rf"(?:\.{JS_SPACE_RE}WebSocket|\[{JS_SPACE_RE}{JS_STRING_QUOTE_RE}WebSocket{JS_STRING_QUOTE_RE}{JS_SPACE_RE}\]))"
+)
+JS_WS_REFLECT_GET_RE = (
+    rf"Reflect\.get{JS_SPACE_RE}\({JS_SPACE_RE}(?:{JS_GLOBAL_RE}|\({JS_SPACE_RE}{JS_GLOBAL_RE}{JS_SPACE_RE}\))"
+    rf"{JS_SPACE_RE},{JS_SPACE_RE}{JS_STRING_QUOTE_RE}WebSocket{JS_STRING_QUOTE_RE}{JS_SPACE_RE}\)"
+)
+JS_WS_REFERENCE_RE = (
+    rf"(?:\({JS_SPACE_RE})*(?:WebSocket\b|{JS_WS_GLOBAL_ACCESS_RE}|{JS_WS_MEMBER_ACCESS_RE})"
+    rf"{JS_SPACE_RE}(?:\){JS_SPACE_RE})*"
+)
+JS_WS_BIND_RE = (
+    rf"{JS_WS_REFERENCE_RE}{JS_SPACE_RE}(?:"
+    rf"(?:\.|\?\.){JS_SPACE_RE}bind|"
+    rf"\[{JS_SPACE_RE}{JS_STRING_QUOTE_RE}bind{JS_STRING_QUOTE_RE}{JS_SPACE_RE}\]"
+    rf"){JS_SPACE_RE}\("
+)
+DYNAMIC_COMPILE_CALL_RE = re.compile(
+    rf"(?<![A-Za-z0-9_$])(?:(?P<receiver>{JS_IDENTIFIER_RE}(?:\.{JS_IDENTIFIER_RE})*)\.)?\$?compile\s*\("
+)
+MULTILINE_WS_IMPORT_RE = re.compile(
+    r"\bimport\s*\{[^};]{0,500}\bWebSocket\b[^};]{0,500}\}\s*from\s*['\"]ws['\"]",
+    re.IGNORECASE,
+)
+MULTILINE_WEBSOCKET_PACKAGE_IMPORT_RE = re.compile(
+    r"\bimport\s*\{[^};]{0,500}\}\s*from\s*['\"]websocket['\"]",
+    re.IGNORECASE,
+)
+MULTILINE_WS_DEFAULT_IMPORT_RE = re.compile(
+    rf"\bimport{JS_REQUIRED_SPACE_RE}{JS_IDENTIFIER_RE}"
+    rf"(?:{JS_SPACE_RE},{JS_SPACE_RE}\{{[^;]{{0,500}}?\}})?"
+    rf"{JS_REQUIRED_SPACE_RE}from{JS_SPACE_RE}['\"](?:ws|websocket)['\"]",
+    re.IGNORECASE,
+)
+MULTILINE_WS_NAMESPACE_IMPORT_RE = re.compile(
+    rf"\bimport{JS_REQUIRED_SPACE_RE}\*{JS_REQUIRED_SPACE_RE}as{JS_REQUIRED_SPACE_RE}{JS_IDENTIFIER_RE}"
+    rf"{JS_REQUIRED_SPACE_RE}from{JS_SPACE_RE}['\"](?:ws|websocket)['\"]",
+    re.IGNORECASE,
+)
+MULTILINE_WS_DYNAMIC_IMPORT_RE = re.compile(
+    rf"\bimport{JS_SPACE_RE}\({JS_SPACE_RE}['\"](?:ws|websocket)['\"]{JS_SPACE_RE}\)",
+    re.IGNORECASE,
+)
+MULTILINE_WS_REQUIRE_RE = re.compile(
+    rf"\brequire{JS_SPACE_RE}\({JS_SPACE_RE}['\"](?:ws|websocket)['\"]{JS_SPACE_RE}\)",
+    re.IGNORECASE,
+)
+MULTILINE_WS_EXPORT_RE = re.compile(
+    r"\bexport\b[^;]{0,500}\bfrom\s*['\"](?:ws|websocket)['\"]",
+    re.IGNORECASE,
+)
+MULTILINE_WS_ANY_IMPORT_RE = re.compile(
+    rf"\bimport(?:{JS_REQUIRED_SPACE_RE}type)?{JS_REQUIRED_SPACE_RE}(?:"
+    rf"\{{[^;]{{0,500}}\bWebSocket\b[^;]{{0,500}}\}}|"
+    rf"{JS_IDENTIFIER_RE}{JS_SPACE_RE},{JS_SPACE_RE}\{{[^;]{{0,500}}\bWebSocket\b[^;]{{0,500}}\}}|"
+    rf"WebSocket\b(?:{JS_SPACE_RE},{JS_SPACE_RE}\{{[^;]{{0,500}}\}})?"
+    rf"){JS_REQUIRED_SPACE_RE}from{JS_SPACE_RE}['\"][^'\"]+['\"]",
+    re.IGNORECASE,
+)
+MULTILINE_WS_CONSTRUCTOR_RE = re.compile(rf"\bnew{JS_SPACE_RE}{JS_WS_REFERENCE_RE}\(", re.IGNORECASE)
+MULTILINE_WS_REFLECT_CONSTRUCT_RE = re.compile(
+    rf"\bReflect\.construct{JS_SPACE_RE}\({JS_SPACE_RE}{JS_WS_REFERENCE_RE}",
+    re.IGNORECASE,
+)
+MULTILINE_WS_WRAPPED_REFERENCE_RE = re.compile(
+    rf"\[{JS_SPACE_RE}{JS_WS_REFERENCE_RE}{JS_SPACE_RE}\](?:{JS_SPACE_RE}\[{JS_SPACE_RE}\d+{JS_SPACE_RE}\])?",
+    re.IGNORECASE,
+)
+MULTILINE_WS_BIND_RE = re.compile(JS_WS_BIND_RE, re.IGNORECASE)
+MULTILINE_WS_DESTRUCTURED_ALIAS_RE = re.compile(
+    rf"(?:\b(?:const|let|var)\s*)?\(?\s*\{{[\s\S]{{0,500}}?\bWebSocket\b(?:\s*:\s*{JS_IDENTIFIER_RE})?"
+    rf"[\s\S]{{0,500}}?\}}\s*=\s*(?:{JS_GLOBAL_RE}|{JS_OBJECT_RE})\b",
+    re.IGNORECASE,
+)
+MULTILINE_WS_ALIAS_RE = re.compile(
+    rf"\b(?:(?:const|let|var)\s+)?{JS_IDENTIFIER_RE}\s*="
+    rf"\s*(?:{JS_WS_REFERENCE_RE}|{JS_WS_MEMBER_ACCESS_RE}|{JS_WS_REFLECT_GET_RE})",
+    re.IGNORECASE,
+)
+MULTILINE_WS_EXTENDS_RE = re.compile(
+    rf"\bclass(?:\s+{JS_IDENTIFIER_RE})?\s+extends{JS_SPACE_RE}(?:{JS_WS_REFERENCE_RE}|{JS_WS_MEMBER_ACCESS_RE})",
+    re.IGNORECASE,
+)
+MULTILINE_PY_WEBSOCKET_IMPORT_RE = re.compile(
+    r"\bfrom\s+websocket\s+import\s*(?:"
+    r"\([^)]{0,500}(?:\b(?:create_connection|WebSocket(?:App)?)\b|\*)[^)]{0,500}\)|"
+    r"\\\s*\n\s*(?:create_connection|WebSocket(?:App)?|\*)\b"
+    r")",
+    re.IGNORECASE,
+)
 
 
 class InspectError(RuntimeError):
@@ -185,8 +297,43 @@ WARNING_RULES = (
         "network-client",
         "WARNING",
         re.compile(
-            r"\b(requests\.|urllib\.request|httpx\.|fetch\(|XMLHttpRequest|"
-            r"curl\b|wget\b|socket\.|WebSocket)\b",
+            r"\b(?:requests|httpx|socket)\.[A-Za-z_]\w*|"
+            r"\burllib\.request\b|"
+            r"\b(?:XMLHttpRequest|curl|wget)\b|"
+            r"\bimport\s+websocket\b|"
+            r"\b__import__\(\s*['\"]websocket['\"]\s*\)|"
+            r"\bfrom\s+websocket\s+import\s+\*|"
+            r"\bfrom\s+websocket\s+import\s+[^\n;]*\b(?:create_connection|WebSocket(?:App)?)\b|"
+            r"\bimport\s+websocket\s+as\s+[A-Za-z_]\w*\b|"
+            r"\bwebsocket\.(?:create_connection|WebSocket(?:App)?)\b|"
+            rf"\b(?:fetch|WebSocket){JS_SPACE_RE}\(|"
+            rf"(?:\(|,){JS_SPACE_RE}{JS_WS_REFERENCE_RE}{JS_SPACE_RE}(?:,|\))|"
+            rf"\bnew{JS_SPACE_RE}{JS_WS_REFERENCE_RE}\(|"
+            rf"{JS_WS_BIND_RE}|"
+            rf"\bReflect\.construct{JS_SPACE_RE}\({JS_SPACE_RE}{JS_WS_REFERENCE_RE}|"
+            rf"\[{JS_SPACE_RE}{JS_WS_REFERENCE_RE}{JS_SPACE_RE}\](?:{JS_SPACE_RE}\[{JS_SPACE_RE}\d+{JS_SPACE_RE}\])?|"
+            r"(?:\b(?:const|let|var)\s*)?\(?\s*\{[^\n;]*\bWebSocket\b(?:\s*:\s*[A-Za-z_$][A-Za-z0-9_$]*)?"
+            rf"[^\n;]*\}}\s*=\s*(?:{JS_GLOBAL_RE}|{JS_OBJECT_RE})\b|"
+            rf"\b(?:(?:const|let|var)\s+)?{JS_IDENTIFIER_RE}\s*="
+            rf"\s*(?:{JS_WS_REFERENCE_RE}|{JS_WS_MEMBER_ACCESS_RE}|{JS_WS_REFLECT_GET_RE})|"
+            rf"\bclass(?:\s+{JS_IDENTIFIER_RE})?\s+extends{JS_SPACE_RE}(?:{JS_WS_REFERENCE_RE}|{JS_WS_MEMBER_ACCESS_RE})|"
+            rf"{JS_WS_REFLECT_GET_RE}|"
+            rf"{JS_WS_GLOBAL_ACCESS_RE}|"
+            r"\brequire\s*\(\s*['\"]ws['\"]\s*\)(?:\.WebSocket)?|"
+            r"\brequire\s*\(\s*['\"]websocket['\"]\s*\)(?:\.[A-Za-z_]\w*)?|"
+            rf"\bimport{JS_SPACE_RE}\({JS_SPACE_RE}['\"](?:ws|websocket)['\"]{JS_SPACE_RE}\)|"
+            rf"\bimport{JS_REQUIRED_SPACE_RE}\*{JS_REQUIRED_SPACE_RE}as{JS_REQUIRED_SPACE_RE}{JS_IDENTIFIER_RE}"
+            rf"{JS_REQUIRED_SPACE_RE}from{JS_SPACE_RE}['\"](?:ws|websocket)['\"]|"
+            rf"\bimport{JS_REQUIRED_SPACE_RE}{JS_IDENTIFIER_RE}(?:{JS_SPACE_RE},[^\n;]*)?"
+            rf"{JS_REQUIRED_SPACE_RE}from{JS_SPACE_RE}['\"](?:ws|websocket)['\"]|"
+            rf"\bimport(?:{JS_REQUIRED_SPACE_RE}type)?{JS_REQUIRED_SPACE_RE}(?:"
+            rf"\{{[^\n;]*\bWebSocket\b[^\n;]*\}}|"
+            rf"{JS_IDENTIFIER_RE}{JS_SPACE_RE},{JS_SPACE_RE}\{{[^\n;]*\bWebSocket\b[^\n;]*\}}|"
+            rf"WebSocket\b(?:{JS_SPACE_RE},[^\n;]*)?"
+            rf"){JS_REQUIRED_SPACE_RE}from{JS_SPACE_RE}['\"][^'\"]+['\"]|"
+            r"\bimport\b[^\n;]*\bWebSocket\b[^\n;]*\bfrom\s*['\"]ws['\"]|"
+            r"\bimport\b[^\n;]*\bfrom\s*['\"]websocket['\"]|"
+            r"\bexport\b[^\n;]*\bfrom\s*['\"](?:ws|websocket)['\"]",
             re.IGNORECASE,
         ),
         "Network-capable code or command requires manual review.",
@@ -204,8 +351,12 @@ WARNING_RULES = (
     Rule(
         "dynamic-code-execution",
         "WARNING",
-        re.compile(r"\b(eval\(|exec\(|compile\(|new Function\(|pickle\.loads|marshal\.loads)\b"),
-        "Dynamic code execution requires manual review.",
+        re.compile(
+            r"\b(?:eval|exec)\s*\(|"
+            r"\bnew\s+Function\s*\(|"
+            r"\b(?:pickle|marshal)\.loads\b"
+        ),
+        DYNAMIC_CODE_MESSAGE,
     ),
     Rule(
         "environment-access",
@@ -286,6 +437,7 @@ def audit_skill(root: Path) -> list[Finding]:
         else:
             findings.extend(audit_skill_md(root, text))
 
+    local_python_modules = collect_local_python_modules(root)
     for path in iter_skill_files(root):
         rel_path = path.relative_to(root).as_posix()
         findings.extend(audit_file_metadata(root, path, rel_path))
@@ -295,7 +447,7 @@ def audit_skill(root: Path) -> list[Finding]:
         if text is None:
             findings.extend(audit_binary_file(path, rel_path))
             continue
-        findings.extend(audit_text_file(rel_path, text))
+        findings.extend(audit_text_file(rel_path, text, local_python_modules=local_python_modules))
         findings.extend(audit_dependency_file(rel_path, text))
 
     return sorted(findings, key=lambda item: (SEVERITY_ORDER[item.severity], item.path, item.code))
@@ -308,6 +460,19 @@ def iter_skill_files(root: Path) -> Iterable[Path]:
             continue
         if path.is_file() or path.is_symlink():
             yield path
+
+
+def collect_local_python_modules(root: Path) -> set[str]:
+    modules: set[str] = set()
+    for path in root.rglob("*"):
+        rel_parts = path.relative_to(root).parts
+        if any(part in SKIP_DIRS for part in rel_parts[:-1]):
+            continue
+        if path.is_dir() and (path / "__init__.py").exists():
+            modules.add(path.name)
+        elif path.suffix == ".py":
+            modules.add(path.stem)
+    return modules
 
 
 def audit_file_metadata(root: Path, path: Path, rel_path: str) -> list[Finding]:
@@ -422,18 +587,802 @@ def audit_skill_md(root: Path, text: str) -> list[Finding]:
     return findings
 
 
-def audit_text_file(rel_path: str, text: str) -> list[Finding]:
+def audit_text_file(rel_path: str, text: str, *, local_python_modules: set[str] | None = None) -> list[Finding]:
     findings: list[Finding] = []
     if "TODO:" in text or "[TODO" in text:
         findings.append(Finding("WARNING", "template-marker", rel_path, None, "Template TODO marker remains in the skill."))
 
+    findings.extend(audit_multiline_network_clients(rel_path, text))
     for line_number, line in enumerate(text.splitlines(), start=1):
         for rule in (*SECRET_RULES, *BLOCK_RULES, *WARNING_RULES):
             if rule.pattern.search(line):
                 if rule in SECRET_RULES and looks_like_placeholder(line):
                     continue
                 findings.append(Finding(rule.severity, rule.code, rel_path, line_number, rule.message))
+    findings.extend(audit_dynamic_compile_calls(rel_path, text, local_python_modules=local_python_modules or set()))
     return findings
+
+
+def audit_multiline_network_clients(rel_path: str, text: str) -> list[Finding]:
+    findings: list[Finding] = []
+    for pattern in (
+        MULTILINE_WS_IMPORT_RE,
+        MULTILINE_WEBSOCKET_PACKAGE_IMPORT_RE,
+        MULTILINE_WS_DEFAULT_IMPORT_RE,
+        MULTILINE_WS_NAMESPACE_IMPORT_RE,
+        MULTILINE_WS_DYNAMIC_IMPORT_RE,
+        MULTILINE_WS_REQUIRE_RE,
+        MULTILINE_WS_EXPORT_RE,
+        MULTILINE_WS_ANY_IMPORT_RE,
+        MULTILINE_WS_CONSTRUCTOR_RE,
+        MULTILINE_WS_REFLECT_CONSTRUCT_RE,
+        MULTILINE_WS_WRAPPED_REFERENCE_RE,
+        MULTILINE_WS_BIND_RE,
+        MULTILINE_WS_DESTRUCTURED_ALIAS_RE,
+        MULTILINE_WS_ALIAS_RE,
+        MULTILINE_WS_EXTENDS_RE,
+        MULTILINE_PY_WEBSOCKET_IMPORT_RE,
+    ):
+        for match in pattern.finditer(text):
+            if "\n" not in match.group(0):
+                continue
+            line_number = text.count("\n", 0, match.start()) + 1
+            findings.append(
+                Finding(
+                    "WARNING",
+                    "network-client",
+                    rel_path,
+                    line_number,
+                    "Network-capable code or command requires manual review.",
+                )
+            )
+    return findings
+
+
+def has_spaced_receiver_dot(text: str, index: int) -> bool:
+    i = index - 1
+    while i >= 0 and text[i] in " \t\f\v":
+        i -= 1
+    return i >= 0 and text[i] == "."
+
+
+def audit_dynamic_compile_calls(rel_path: str, text: str, *, local_python_modules: set[str]) -> list[Finding]:
+    findings: list[Finding] = []
+    is_python_file = Path(rel_path).suffix in {".py", ".pyi"}
+    line_number = 1
+    line_scan_offset = 0
+    for match in DYNAMIC_COMPILE_CALL_RE.finditer(text):
+        open_paren = text.find("(", match.start(), match.end())
+        args_text = extract_call_args(text, open_paren)
+        line_number += text.count("\n", line_scan_offset, match.start())
+        line_scan_offset = match.start()
+        if args_text is None:
+            findings.append(Finding("WARNING", "dynamic-code-execution", rel_path, line_number, DYNAMIC_CODE_MESSAGE))
+            break
+        args = split_top_level_args(args_text)
+        receiver = match.group("receiver")
+        effective_safe_regex_receivers: set[str] = set()
+        if is_python_file:
+            shadow_text = text[: match.start()]
+            call_line_start = text.rfind("\n", 0, match.start()) + 1
+            call_line_prefix = text[call_line_start : match.start()]
+            call_indent = len(call_line_prefix) - len(call_line_prefix.lstrip(" \t"))
+            effective_safe_regex_receivers = infer_regex_compile_receivers(
+                shadow_text,
+                local_python_modules,
+                call_indent=call_indent,
+            )
+            if receiver in effective_safe_regex_receivers and (
+                regex_receiver_is_shadowed(receiver, shadow_text, call_indent=call_indent)
+                or receiver_is_bound_later_in_comprehension(receiver, text, match.start())
+                or receiver_is_rebound_later_in_enclosing_scope(receiver, text, match.start(), call_indent)
+            ):
+                effective_safe_regex_receivers.remove(receiver)
+        unmatched_receiver = match.start() > 0 and has_spaced_receiver_dot(text, match.start())
+        if unmatched_receiver or is_dynamic_compile_call(
+            is_python_file,
+            effective_safe_regex_receivers,
+            receiver,
+            args,
+            args_text,
+        ):
+            findings.append(Finding("WARNING", "dynamic-code-execution", rel_path, line_number, DYNAMIC_CODE_MESSAGE))
+    return findings
+
+
+def infer_regex_compile_receivers(text: str, local_python_modules: set[str], *, call_indent: int) -> set[str]:
+    receivers: set[str] = set()
+    lines = text.splitlines()
+    scope_body_start = python_current_scope_body_start(lines, call_indent)
+    for index, line in enumerate(lines):
+        code_part = line.partition("#")[0]
+        if not code_part.strip():
+            continue
+        indent = len(code_part) - len(code_part.lstrip(" \t"))
+        in_current_scope = index >= scope_body_start
+        if (in_current_scope and indent > call_indent) or (not in_current_scope and indent >= call_indent):
+            continue
+        code = code_part.strip()
+        if not code.startswith("import "):
+            continue
+        prefix_text = "\n".join(lines[:index])
+        for imported in code.removeprefix("import ").split(","):
+            parts = imported.strip().split()
+            if not parts or parts[0] not in {"re", "regex"} or parts[0] in local_python_modules:
+                continue
+            if python_sys_modules_spoofs_module(prefix_text, {parts[0]}):
+                continue
+            receiver = parts[2] if len(parts) >= 3 and parts[1] == "as" else parts[0]
+            receivers.add(receiver)
+
+    return receivers
+
+
+def regex_receiver_is_shadowed(receiver: str, text: str, *, call_indent: int) -> bool:
+    escaped = re.escape(receiver)
+    scoped_text = python_shadow_text_for_call_scope(text, call_indent)
+    code_lines = [line.strip() for line in scoped_text.splitlines()]
+    if python_receiver_is_shadowed_by_ast(receiver, text, call_indent=call_indent):
+        return True
+    if python_sys_modules_spoofs_module(scoped_text, {"re", "regex"}):
+        return True
+    if regex_receiver_alias_compile_is_mutated(receiver, scoped_text):
+        return True
+    if re.search(rf"(?m)(?:^|[;:])\s*{escaped}\s*(?::[^=\n]+)?=", scoped_text):
+        return True
+    if re.search(rf"(?m)(?:^|[;:(,])\s*{escaped}\s*:=", scoped_text):
+        return True
+    if re.search(rf"\b(?:globals|locals)\s*\(\s*\)\s*\[\s*['\"]{escaped}['\"]\s*\]\s*=", scoped_text):
+        return True
+    if re.search(rf"\bvars\s*\(\s*\)\s*\[\s*['\"]{escaped}['\"]\s*\]\s*=", scoped_text):
+        return True
+    if re.search(rf"\b(?:globals|locals)\s*\(\s*\)\s*\.\s*__setitem__\s*\(\s*['\"]{escaped}['\"]\s*,", scoped_text):
+        return True
+    if re.search(rf"\bvars\s*\(\s*\)\s*\.\s*__setitem__\s*\(\s*['\"]{escaped}['\"]\s*,", scoped_text):
+        return True
+    if re.search(rf"\b(?:globals|locals)\s*\(\s*\)\s*\.\s*update\s*\([\s\S]{{0,500}}\b{escaped}\s*=", scoped_text):
+        return True
+    if re.search(rf"\bvars\s*\(\s*\)\s*\.\s*update\s*\([\s\S]{{0,500}}\b{escaped}\s*=", scoped_text):
+        return True
+    if re.search(rf"\b(?:globals|locals)\s*\(\s*\)\s*\.\s*update\s*\([\s\S]{{0,500}}['\"]{escaped}['\"]\s*:", scoped_text):
+        return True
+    if re.search(rf"\bvars\s*\(\s*\)\s*\.\s*update\s*\([\s\S]{{0,500}}['\"]{escaped}['\"]\s*:", scoped_text):
+        return True
+    if re.search(rf"(?m)(?:^|[;:])\s*{escaped}\s*\.\s*compile\s*=", scoped_text):
+        return True
+    if re.search(rf"\b{escaped}\s*\.\s*__setattr__\s*\(\s*['\"]compile['\"]\s*,", scoped_text):
+        return True
+    if re.search(rf"\b(?:{JS_IDENTIFIER_RE}\.)?__setattr__\s*\(\s*{escaped}\s*,\s*['\"]compile['\"]\s*,", scoped_text):
+        return True
+    if re.search(rf"\b(?:{JS_IDENTIFIER_RE}\.)?setattr\s*\(\s*{escaped}\s*,\s*['\"]compile['\"]\s*,", scoped_text):
+        return True
+    if re.search(rf"{escaped}\s*\.\s*__dict__\s*\[\s*['\"]compile['\"]\s*\]\s*=", scoped_text):
+        return True
+    if re.search(rf"{escaped}\s*\.\s*__dict__\s*\.\s*__setitem__\s*\(\s*['\"]compile['\"]\s*,", scoped_text):
+        return True
+    if re.search(rf"{escaped}\s*\.\s*__dict__\s*\.\s*update\s*\([\s\S]{{0,500}}\bcompile\s*=", scoped_text):
+        return True
+    if re.search(rf"{escaped}\s*\.\s*__dict__\s*\.\s*update\s*\([\s\S]{{0,500}}['\"]compile['\"]\s*:", scoped_text):
+        return True
+    if re.search(rf"\bvars\s*\(\s*{escaped}\s*\)\s*\[\s*['\"]compile['\"]\s*\]\s*=", scoped_text):
+        return True
+    if re.search(rf"\bvars\s*\(\s*{escaped}\s*\)\s*\.\s*__setitem__\s*\(\s*['\"]compile['\"]\s*,", scoped_text):
+        return True
+    if re.search(rf"\bvars\s*\(\s*{escaped}\s*\)\s*\.\s*update\s*\([\s\S]{{0,500}}\bcompile\s*=", scoped_text):
+        return True
+    if re.search(rf"\bvars\s*\(\s*{escaped}\s*\)\s*\.\s*update\s*\([\s\S]{{0,500}}['\"]compile['\"]\s*:", scoped_text):
+        return True
+    if receiver_is_bound_as_function_argument(receiver, scoped_text, call_indent):
+        return True
+    if receiver_is_bound_as_lambda_argument(receiver, scoped_text, call_indent):
+        return True
+    if re.search(rf"(?m)\bfor\s+[^\n:]*\b{escaped}\b[^\n:]*\bin\b", scoped_text):
+        return True
+    if re.search(rf"(?m)\b(?:with|except)\b[^\n:]*\bas\s+{escaped}\b", scoped_text):
+        return True
+    if re.search(rf"(?m)\bcase\b[^\n]*\b{escaped}\b[^\n]*:", scoped_text):
+        return True
+    if from_import_shadows_receiver(receiver, scoped_text):
+        return True
+
+    for code in code_lines:
+        if code.startswith("import "):
+            for imported in code.removeprefix("import ").split(","):
+                parts = imported.strip().split()
+                if not parts:
+                    continue
+                module_name = parts[0]
+                bound_name = parts[2] if len(parts) >= 3 and parts[1] == "as" else module_name.split(".", 1)[0]
+                if bound_name == receiver and module_name not in {"re", "regex"}:
+                    return True
+        elif code.startswith("from "):
+            match = re.match(r"from\s+([A-Za-z_][\w.]*)\s+import\s+(.+)", code)
+            if not match or match.group(1) in {"re", "regex"}:
+                continue
+            for imported in match.group(2).split(","):
+                parts = imported.strip().split()
+                if not parts:
+                    continue
+                imported_name = parts[0]
+                bound_name = parts[2] if len(parts) >= 3 and parts[1] == "as" else imported_name
+                if bound_name == receiver:
+                    return True
+    return False
+
+
+def regex_receiver_alias_compile_is_mutated(receiver: str, text: str) -> bool:
+    aliases = {receiver}
+    while True:
+        escaped_aliases = "|".join(sorted((re.escape(alias) for alias in aliases), key=len, reverse=True))
+        alias_assignment_pattern = re.compile(
+            rf"(?m)(?:^|[;:])\s*(?P<alias>{JS_IDENTIFIER_RE})\s*(?::[^=\n]+)?="
+            rf"\s*\(?\s*(?:{escaped_aliases})\s*\)?\s*(?:$|[;#\n])"
+        )
+        new_aliases = {match.group("alias") for match in alias_assignment_pattern.finditer(text)} - aliases
+        if not new_aliases:
+            break
+        aliases.update(new_aliases)
+
+    escaped_aliases = "|".join(sorted((re.escape(alias) for alias in aliases), key=len, reverse=True))
+    if not escaped_aliases:
+        return False
+
+    return any(
+        re.search(pattern, text)
+        for pattern in (
+            rf"(?m)(?:^|[;:])\s*(?:{escaped_aliases})\s*\.\s*compile\s*=",
+            rf"\b(?:{escaped_aliases})\s*\.\s*__setattr__\s*\(\s*['\"]compile['\"]\s*,",
+            rf"\b(?:{JS_IDENTIFIER_RE}\.)?__setattr__\s*\(\s*(?:{escaped_aliases})\s*,\s*['\"]compile['\"]\s*,",
+            rf"\b(?:{JS_IDENTIFIER_RE}\.)?setattr\s*\(\s*(?:{escaped_aliases})\s*,\s*['\"]compile['\"]\s*,",
+            rf"(?:{escaped_aliases})\s*\.\s*__dict__\s*\[\s*['\"]compile['\"]\s*\]\s*=",
+            rf"(?:{escaped_aliases})\s*\.\s*__dict__\s*\.\s*__setitem__\s*\(\s*['\"]compile['\"]\s*,",
+            rf"(?:{escaped_aliases})\s*\.\s*__dict__\s*\.\s*update\s*\([\s\S]{{0,500}}\bcompile\s*=",
+            rf"(?:{escaped_aliases})\s*\.\s*__dict__\s*\.\s*update\s*\([\s\S]{{0,500}}['\"]compile['\"]\s*:",
+            rf"\bvars\s*\(\s*(?:{escaped_aliases})\s*\)\s*\[\s*['\"]compile['\"]\s*\]\s*=",
+            rf"\bvars\s*\(\s*(?:{escaped_aliases})\s*\)\s*\.\s*__setitem__\s*\(\s*['\"]compile['\"]\s*,",
+            rf"\bvars\s*\(\s*(?:{escaped_aliases})\s*\)\s*\.\s*update\s*\([\s\S]{{0,500}}\bcompile\s*=",
+            rf"\bvars\s*\(\s*(?:{escaped_aliases})\s*\)\s*\.\s*update\s*\([\s\S]{{0,500}}['\"]compile['\"]\s*:",
+        )
+    )
+
+
+def python_shadow_text_for_call_scope(text: str, call_indent: int) -> str:
+    lines = text.splitlines()
+    scope_body_start = python_current_scope_body_start(lines, call_indent)
+    scoped_lines = []
+    continuation_depth = 0
+    for index, line in enumerate(lines):
+        code = line.partition("#")[0]
+        if not code.strip():
+            scoped_lines.append("")
+            continue
+        indent = len(code) - len(code.lstrip(" \t"))
+        in_current_scope = index >= scope_body_start
+        keep_line = indent < call_indent or (in_current_scope and indent <= call_indent) or continuation_depth > 0
+        scoped_lines.append(code if keep_line else "")
+        if keep_line:
+            continuation_depth = max(0, continuation_depth + python_bracket_delta(code))
+    return "\n".join(scoped_lines)
+
+
+def python_current_scope_body_start(lines: list[str], call_indent: int) -> int:
+    if call_indent <= 0:
+        return 0
+    for index in range(len(lines) - 1, -1, -1):
+        code = lines[index].partition("#")[0]
+        if not code.strip():
+            continue
+        indent = len(code) - len(code.lstrip(" \t"))
+        stripped = code.strip()
+        if indent < call_indent and re.match(r"(?:async\s+def|def|class)\b.*:\s*$", stripped):
+            return index + 1
+    return 0
+
+
+def python_bracket_delta(line: str) -> int:
+    delta = 0
+    quote: str | None = None
+    escaped = False
+    for char in line:
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+        elif char in "([{":
+            delta += 1
+        elif char in ")]}":
+            delta -= 1
+    return delta
+
+
+def receiver_is_bound_later_in_comprehension(receiver: str, text: str, match_start: int) -> bool:
+    escaped = re.escape(receiver)
+    window = text[match_start : match_start + 500]
+    for match in re.finditer(r"\bfor\b(?P<target>[^\n]{0,250}?)\bin\b", window):
+        if re.search(rf"\b{escaped}\b", match.group("target")):
+            return True
+    return False
+
+
+def receiver_is_rebound_later_in_enclosing_scope(
+    receiver: str,
+    text: str,
+    match_start: int,
+    call_indent: int,
+) -> bool:
+    if call_indent <= 0:
+        return False
+
+    escaped = re.escape(receiver)
+    for line in text[match_start:].splitlines()[1:]:
+        code = line.partition("#")[0]
+        if not code.strip():
+            continue
+        indent = len(code) - len(code.lstrip(" \t"))
+        if indent >= call_indent:
+            continue
+        stripped = code.strip()
+        if re.match(rf"{escaped}\s*(?::[^=\n]+)?=", stripped):
+            return True
+        if re.match(rf"(?:global|nonlocal)\s+.*\b{escaped}\b", stripped):
+            return True
+        if from_import_shadows_receiver(receiver, stripped):
+            return True
+        if stripped.startswith("import "):
+            for imported in stripped.removeprefix("import ").split(","):
+                parts = imported.strip().split()
+                if not parts:
+                    continue
+                module_name = parts[0]
+                bound_name = parts[2] if len(parts) >= 3 and parts[1] == "as" else module_name.split(".", 1)[0]
+                if bound_name == receiver and module_name not in {"re", "regex"}:
+                    return True
+    return False
+
+
+def receiver_is_bound_as_function_argument(receiver: str, text: str, call_indent: int) -> bool:
+    if call_indent <= 0:
+        return False
+    escaped = re.escape(receiver)
+    pattern = re.compile(
+        r"(?m)^(?P<indent>[ \t]*)(?:async\s+def|def)\s+[A-Za-z_]\w*"
+        r"\s*\((?P<args>[\s\S]{0,500}?)\)\s*:"
+    )
+    candidates = [match for match in pattern.finditer(text) if len(match.group("indent")) < call_indent]
+    if not candidates:
+        return False
+    return bool(re.search(rf"\b{escaped}\b", candidates[-1].group("args")))
+
+
+def receiver_is_bound_as_lambda_argument(receiver: str, text: str, call_indent: int) -> bool:
+    escaped = re.escape(receiver)
+    multiline_lambda_args_pattern = re.compile(r"\blambda\s+(?P<args>[\s\S]{0,500}?):\s*$")
+    if any(re.search(rf"\b{escaped}\b", match.group("args")) for match in multiline_lambda_args_pattern.finditer(text)):
+        return True
+
+    lambda_args_pattern = re.compile(r"\blambda\s+(?P<args>[^:\n]{0,500}):")
+    lines = text.splitlines()
+    if lines and any(
+        re.search(rf"\b{escaped}\b", match.group("args")) for match in lambda_args_pattern.finditer(lines[-1])
+    ):
+        return True
+    if call_indent <= 0:
+        return False
+    for line in text.splitlines():
+        indent = len(line) - len(line.lstrip(" \t"))
+        if indent < call_indent and any(
+            re.search(rf"\b{escaped}\b", match.group("args")) for match in lambda_args_pattern.finditer(line)
+        ):
+            return True
+    return False
+
+
+def python_receiver_is_shadowed_by_ast(receiver: str, text: str, *, call_indent: int) -> bool:
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        try:
+            tree = ast.parse(f"{text}pass\n")
+        except SyntaxError:
+            return False
+
+    lines = text.splitlines()
+    scope_body_start = python_current_scope_body_start(lines, call_indent)
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+
+    def node_reaches_call_scope(node: ast.AST) -> bool:
+        if node_has_nested_scope_ancestor(node):
+            return False
+        line_index = getattr(node, "lineno", 1) - 1
+        col_offset = getattr(node, "col_offset", 0)
+        if line_index < scope_body_start:
+            return col_offset < call_indent
+        return True
+
+    def node_is_current_scope_header(node: ast.AST) -> bool:
+        return getattr(node, "lineno", 1) - 1 == scope_body_start - 1
+
+    def node_has_nested_scope_ancestor(node: ast.AST) -> bool:
+        parent = parents.get(node)
+        while parent is not None:
+            if isinstance(parent, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                if not node_is_current_scope_header(parent):
+                    parent_line = getattr(parent, "lineno", 1) - 1
+                    parent_col = getattr(parent, "col_offset", 0)
+                    if parent_line >= scope_body_start or parent_col >= call_indent:
+                        return True
+            parent = parents.get(parent)
+        return False
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node_reaches_call_scope(node) and function_global_rebinds_name(node, receiver):
+                return True
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == receiver:
+            if node_reaches_call_scope(node):
+                return True
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            if node_is_current_scope_header(node) and ast_arguments_bind_name(node.args, receiver):
+                return True
+        elif isinstance(node, ast.Assign):
+            if node_reaches_call_scope(node) and any(ast_target_binds_name(target, receiver) for target in node.targets):
+                return True
+            if node_reaches_call_scope(node) and any(
+                ast_target_mutates_compile_attr(target, receiver) for target in node.targets
+            ):
+                return True
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+            if node_reaches_call_scope(node) and ast_target_binds_name(node.target, receiver):
+                return True
+            if node_reaches_call_scope(node) and ast_target_mutates_compile_attr(node.target, receiver):
+                return True
+        elif isinstance(node, ast.Call):
+            if node_reaches_call_scope(node) and ast_call_mutates_compile_attr(node, receiver):
+                return True
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            if node_reaches_call_scope(node) and ast_target_binds_name(node.target, receiver):
+                return True
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            if node_reaches_call_scope(node):
+                for item in node.items:
+                    if item.optional_vars is not None and ast_target_binds_name(item.optional_vars, receiver):
+                        return True
+        elif isinstance(node, ast.ExceptHandler):
+            if node_reaches_call_scope(node) and node.name == receiver:
+                return True
+        elif isinstance(node, ast.match_case):
+            pattern = node.pattern
+            if node_reaches_call_scope(pattern) and ast_pattern_binds_name(pattern, receiver):
+                return True
+        elif isinstance(node, ast.Import):
+            if node_reaches_call_scope(node):
+                for alias in node.names:
+                    bound_name = alias.asname or alias.name.split(".", 1)[0]
+                    if bound_name == receiver and alias.name not in {"re", "regex"}:
+                        return True
+        elif isinstance(node, ast.ImportFrom):
+            if node_reaches_call_scope(node):
+                for alias in node.names:
+                    if alias.name == "*" and node.module not in {"re", "regex"}:
+                        return True
+                    bound_name = alias.asname or alias.name
+                    if bound_name == receiver:
+                        return True
+    return False
+
+
+def function_global_rebinds_name(node: ast.FunctionDef | ast.AsyncFunctionDef, name: str) -> bool:
+    if not any(isinstance(child, ast.Global) and name in child.names for child in ast.walk(node)):
+        return False
+
+    for child in ast.walk(node):
+        if child is node:
+            continue
+        if isinstance(child, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and child.name == name:
+            return True
+        if isinstance(child, ast.Assign):
+            if any(ast_target_binds_name(target, name) for target in child.targets):
+                return True
+        elif isinstance(child, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+            if ast_target_binds_name(child.target, name):
+                return True
+        elif isinstance(child, (ast.For, ast.AsyncFor)):
+            if ast_target_binds_name(child.target, name):
+                return True
+        elif isinstance(child, (ast.With, ast.AsyncWith)):
+            if any(item.optional_vars is not None and ast_target_binds_name(item.optional_vars, name) for item in child.items):
+                return True
+        elif isinstance(child, ast.ExceptHandler):
+            if child.name == name:
+                return True
+        elif isinstance(child, ast.Import):
+            for alias in child.names:
+                if (alias.asname or alias.name.split(".", 1)[0]) == name:
+                    return True
+        elif isinstance(child, ast.ImportFrom):
+            for alias in child.names:
+                if (alias.asname or alias.name) == name:
+                    return True
+    return False
+
+
+def ast_arguments_bind_name(arguments: ast.arguments, name: str) -> bool:
+    positional = [*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs]
+    optional = [arguments.vararg, arguments.kwarg]
+    return any(arg.arg == name for arg in positional) or any(arg is not None and arg.arg == name for arg in optional)
+
+
+def ast_pattern_binds_name(pattern: ast.AST, name: str) -> bool:
+    if isinstance(pattern, ast.MatchAs):
+        return pattern.name == name or (
+            pattern.pattern is not None and ast_pattern_binds_name(pattern.pattern, name)
+        )
+    if isinstance(pattern, ast.MatchStar):
+        return pattern.name == name
+    if isinstance(pattern, ast.MatchMapping):
+        return pattern.rest == name or any(ast_pattern_binds_name(item, name) for item in pattern.patterns)
+    if isinstance(pattern, ast.MatchSequence):
+        return any(ast_pattern_binds_name(item, name) for item in pattern.patterns)
+    if isinstance(pattern, ast.MatchClass):
+        return any(ast_pattern_binds_name(item, name) for item in (*pattern.patterns, *pattern.kwd_patterns))
+    if isinstance(pattern, ast.MatchOr):
+        return any(ast_pattern_binds_name(item, name) for item in pattern.patterns)
+    return False
+
+
+def ast_target_binds_name(target: ast.AST, name: str) -> bool:
+    if isinstance(target, ast.Name):
+        return target.id == name
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return any(ast_target_binds_name(element, name) for element in target.elts)
+    if isinstance(target, ast.Starred):
+        return ast_target_binds_name(target.value, name)
+    return False
+
+
+def ast_target_mutates_compile_attr(target: ast.AST, receiver: str) -> bool:
+    if isinstance(target, ast.Attribute):
+        return target.attr == "compile" and ast_expr_is_name(target.value, receiver)
+    if isinstance(target, ast.Subscript):
+        return (
+            ast_expr_is_receiver_attr_dict(target.value, receiver)
+            or ast_expr_is_vars_receiver_call(target.value, receiver)
+        ) and ast_static_string(target.slice) == "compile"
+    return False
+
+
+def ast_call_mutates_compile_attr(node: ast.Call, receiver: str) -> bool:
+    if isinstance(node.func, ast.Name) and node.func.id == "setattr":
+        return (
+            len(node.args) >= 2
+            and ast_expr_is_name(node.args[0], receiver)
+            and ast_static_string(node.args[1]) == "compile"
+        )
+    if isinstance(node.func, ast.Attribute):
+        if node.func.attr == "__setattr__":
+            if ast_expr_is_name(node.func.value, receiver):
+                return bool(node.args) and ast_static_string(node.args[0]) == "compile"
+            if ast_expr_is_object_name(node.func.value):
+                return (
+                    len(node.args) >= 2
+                    and ast_expr_is_name(node.args[0], receiver)
+                    and ast_static_string(node.args[1]) == "compile"
+                )
+        if node.func.attr == "__setitem__":
+            return (
+                bool(node.args)
+                and ast_static_string(node.args[0]) == "compile"
+                and (
+                    ast_expr_is_receiver_attr_dict(node.func.value, receiver)
+                    or ast_expr_is_vars_receiver_call(node.func.value, receiver)
+                )
+            )
+        if node.func.attr == "update" and (
+            ast_expr_is_receiver_attr_dict(node.func.value, receiver)
+            or ast_expr_is_vars_receiver_call(node.func.value, receiver)
+        ):
+            if any(keyword.arg == "compile" for keyword in node.keywords):
+                return True
+            return any(ast_mapping_has_static_key(arg, "compile") for arg in node.args)
+    return False
+
+
+def ast_expr_is_name(node: ast.AST, name: str) -> bool:
+    return isinstance(node, ast.Name) and node.id == name
+
+
+def ast_expr_is_object_name(node: ast.AST) -> bool:
+    return isinstance(node, ast.Name) and node.id == "object"
+
+
+def ast_expr_is_receiver_attr_dict(node: ast.AST, receiver: str) -> bool:
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "__dict__"
+        and ast_expr_is_name(node.value, receiver)
+    )
+
+
+def ast_expr_is_vars_receiver_call(node: ast.AST, receiver: str) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "vars"
+        and len(node.args) == 1
+        and ast_expr_is_name(node.args[0], receiver)
+    )
+
+
+def ast_static_string(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def ast_mapping_has_static_key(node: ast.AST, key: str) -> bool:
+    return isinstance(node, ast.Dict) and any(ast_static_string(dict_key) == key for dict_key in node.keys if dict_key)
+
+
+def from_import_shadows_receiver(receiver: str, text: str) -> bool:
+    for match in re.finditer(
+        r"(?ms)^\s*from\s+([A-Za-z_][\w.]*)\s+import\s*(?:\((?P<paren>.*?)\)|(?P<line>[^\n#]+))",
+        text,
+    ):
+        if match.group(1) in {"re", "regex"}:
+            continue
+        imports = match.group("paren") if match.group("paren") is not None else match.group("line")
+        for imported in imports.split(","):
+            parts = imported.strip().split()
+            if not parts:
+                continue
+            if parts[0] == "*":
+                return True
+            imported_name = parts[0]
+            bound_name = parts[2] if len(parts) >= 3 and parts[1] == "as" else imported_name
+            if bound_name == receiver:
+                return True
+    return False
+
+
+def python_sys_modules_spoofs_module(text: str, module_names: set[str]) -> bool:
+    for module_name in module_names:
+        escaped = re.escape(module_name)
+        if any(
+            re.search(pattern, text)
+            for pattern in (
+                rf"\bsys\s*\.\s*modules\s*\[\s*['\"]{escaped}['\"]\s*\]\s*=",
+                rf"\bsys\s*\.\s*modules\s*\.\s*__setitem__\s*\(\s*['\"]{escaped}['\"]\s*,",
+                rf"\bsys\s*\.\s*modules\s*\.\s*update\s*\([\s\S]{{0,500}}\b{escaped}\s*=",
+                rf"\bsys\s*\.\s*modules\s*\.\s*update\s*\([\s\S]{{0,500}}['\"]{escaped}['\"]\s*:",
+            )
+        ):
+            return True
+    return False
+
+
+def is_dynamic_compile_call(
+    is_python_file: bool,
+    safe_regex_receivers: set[str],
+    receiver: str | None,
+    args: list[str],
+    args_text: str,
+) -> bool:
+    if receiver and receiver not in safe_regex_receivers:
+        return True
+    if receiver is None:
+        return True
+    return has_python_compile_args(args, args_text)
+
+
+def has_python_compile_args(args: list[str], _args_text: str) -> bool:
+    stripped_args = [arg.strip() for arg in args]
+    return (
+        len(stripped_args) >= 3
+        or any(arg.split("=", 1)[0].strip() == "mode" for arg in stripped_args)
+        or any(arg.startswith("*") for arg in stripped_args)
+    )
+
+
+def extract_call_args(text: str, open_paren: int) -> str | None:
+    if open_paren < 0 or open_paren >= len(text) or text[open_paren] != "(":
+        return None
+
+    depth = 0
+    quote: str | None = None
+    triple_quote = False
+    i = open_paren + 1
+    while i < len(text):
+        char = text[i]
+        if quote is not None:
+            if triple_quote and text.startswith(quote * 3, i):
+                quote = None
+                triple_quote = False
+                i += 3
+                continue
+            if not triple_quote:
+                if char == "\\":
+                    i += 2
+                    continue
+                if char == quote:
+                    quote = None
+            i += 1
+            continue
+
+        if char in {"'", '"'}:
+            quote = char
+            triple_quote = text.startswith(char * 3, i)
+            i += 3 if triple_quote else 1
+            continue
+        if char == "#":
+            newline = text.find("\n", i)
+            if newline == -1:
+                return None
+            i = newline + 1
+            continue
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            if depth == 0 and char == ")":
+                return text[open_paren + 1 : i]
+            depth -= 1
+        i += 1
+    return None
+
+
+def split_top_level_args(args_text: str) -> list[str]:
+    args: list[str] = []
+    start = 0
+    depth = 0
+    quote: str | None = None
+    triple_quote = False
+    i = 0
+    while i < len(args_text):
+        char = args_text[i]
+        if quote is not None:
+            if triple_quote and args_text.startswith(quote * 3, i):
+                quote = None
+                triple_quote = False
+                i += 3
+                continue
+            if not triple_quote:
+                if char == "\\":
+                    i += 2
+                    continue
+                if char == quote:
+                    quote = None
+            i += 1
+            continue
+
+        if char in {"'", '"'}:
+            quote = char
+            triple_quote = args_text.startswith(char * 3, i)
+            i += 3 if triple_quote else 1
+            continue
+        if char == "#":
+            newline = args_text.find("\n", i)
+            if newline == -1:
+                break
+            i = newline + 1
+            continue
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif char == "," and depth == 0:
+            args.append(args_text[start:i].strip())
+            start = i + 1
+        i += 1
+
+    args.append(args_text[start:].strip())
+    while args and not args[-1]:
+        args.pop()
+    return args
 
 
 def audit_dependency_file(rel_path: str, text: str) -> list[Finding]:
